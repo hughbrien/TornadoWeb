@@ -14,6 +14,44 @@ import wrapt
 instana.service_name = "Tornado Async 🌪"
 
 
+@wrapt.patch_function_wrapper('aiohttp', 'client.ClientSession.get')
+def urlopen_with_instana(wrapped, instance, args, kwargs):
+	print("Instrumenting aiohttp")
+	context = instana.internal_tracer.current_context()
+
+	# If we're not tracing, just return
+	if context is None:
+		return wrapped(*args, **kwargs)
+
+	try:
+		span = instana.internal_tracer.start_span("aiohttp", child_of=context)
+		span.set_tag(ext.HTTP_URL, args[1])
+		span.set_tag(ext.HTTP_METHOD, args[0])
+
+		instana.internal_tracer.inject(span.context, opentracing.Format.HTTP_HEADERS, kwargs["headers"])
+		rv = wrapped(*args, **kwargs)
+
+		span.set_tag(ext.HTTP_STATUS_CODE, rv.status)
+		if 500 <= rv.status <= 599:
+			span.set_tag("error", True)
+			ec = span.tags.get('ec', 0)
+			span.set_tag("ec", ec + 1)
+
+	except Exception as e:
+		span.log_kv({'message': e})
+		span.set_tag("error", True)
+		ec = span.tags.get('ec', 0)
+		span.set_tag("ec", ec + 1)
+		span.finish()
+		raise
+	else:
+		span.finish()
+		return rv
+
+
+instana.log.debug("Instrumenting aiohttp")
+
+
 @wrapt.patch_function_wrapper('tornado.web', '_HandlerDelegate.execute')
 def wrapRequestHandler(wrapped, instance, args, kwargs):
 	try:
@@ -80,17 +118,10 @@ class MainHandler(RequestHandler):
 
 class BasicHandler(RequestHandler):
 
-
-
 	async def get(self):
-		parent_span = opentracing.tracer.start_span(operation_name="asteroid")
-		applicationSession = ClientSession()
 		self.write("Starting")
 		results = await getWebPage()
 		self.write(results)
-		applicationSession.close()
-		parent_span.finish()
-
 
 
 async def getWebPage() :
@@ -99,7 +130,7 @@ async def getWebPage() :
 	async with applicationSession as client:
 		async with client.get('http://status.instana.io', timeout=None) as response:
 			results = await response.text()
-	applicationSession.close()
+	client.close()
 	return results
 
 
